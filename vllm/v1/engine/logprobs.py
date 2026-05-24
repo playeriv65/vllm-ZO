@@ -19,11 +19,12 @@ from vllm.tokenizers.detokenizer_utils import (
     convert_ids_list_to_tokens,
 )
 from vllm.v1.engine import EngineCoreOutput, EngineCoreRequest
-from vllm.v1.outputs import LogprobsLists, LogprobsTensors
+from vllm.v1.outputs import DirectPromptNLL, LogprobsLists, LogprobsTensors
 
 logger = init_logger(__name__)
 
 NONES = itertools.repeat(None)
+ZO_PROMPT_NLL_KEY = "__zo_prompt_nll__"
 
 
 @dataclass
@@ -38,6 +39,7 @@ class LogprobsProcessor:
     cumulative_logprob: float | None
     num_logprobs: int | None
     num_prompt_logprobs: int | None
+    direct_prompt_nll: bool = False
 
     @classmethod
     def from_new_request(
@@ -49,6 +51,8 @@ class LogprobsProcessor:
         assert sampling_params is not None
         num_logprobs = sampling_params.num_logprobs
         num_prompt_logprobs = sampling_params.prompt_logprobs
+        extra_args = sampling_params.extra_args or {}
+        direct_prompt_nll = bool(extra_args.get("zo_direct_prompt_nll", False))
         return cls(
             tokenizer=tokenizer,
             cumulative_logprob=(None if num_logprobs is None else 0.0),
@@ -60,10 +64,15 @@ class LogprobsProcessor:
             prompt_logprobs=(
                 None
                 if num_prompt_logprobs is None
-                else create_prompt_logprobs(sampling_params.flat_logprobs)
+                else (
+                    {ZO_PROMPT_NLL_KEY: True, "nll_sum": 0.0, "num_tokens": 0}
+                    if direct_prompt_nll
+                    else create_prompt_logprobs(sampling_params.flat_logprobs)
+                )
             ),
             num_prompt_logprobs=num_prompt_logprobs,
             num_logprobs=num_logprobs,
+            direct_prompt_nll=direct_prompt_nll,
         )
 
     def _update_sample_logprobs(self, logprobs_lists: LogprobsLists) -> None:
@@ -120,7 +129,7 @@ class LogprobsProcessor:
 
     def _update_prompt_logprobs(
         self,
-        prompt_logprobs_tensors: LogprobsTensors,
+        prompt_logprobs_tensors: LogprobsTensors | DirectPromptNLL,
     ) -> None:
         """Update with prompt logprobs from EngineCore.
 
@@ -133,6 +142,21 @@ class LogprobsProcessor:
         # Prompt logprobs are enabled.
         assert self.num_prompt_logprobs is not None
         assert self.prompt_logprobs is not None
+
+        if self.direct_prompt_nll:
+            assert isinstance(self.prompt_logprobs, dict)
+            if isinstance(prompt_logprobs_tensors, DirectPromptNLL):
+                self.prompt_logprobs["nll_sum"] += prompt_logprobs_tensors.nll_sum
+                self.prompt_logprobs["num_tokens"] += (
+                    prompt_logprobs_tensors.num_tokens
+                )
+                return
+
+            token_ids, logprobs, ranks, _ = prompt_logprobs_tensors
+            selected_logprobs = logprobs[:, 0]
+            self.prompt_logprobs["nll_sum"] += float((-selected_logprobs).sum().item())
+            self.prompt_logprobs["num_tokens"] += int(selected_logprobs.numel())
+            return
 
         token_ids, logprobs, ranks, _ = prompt_logprobs_tensors
 

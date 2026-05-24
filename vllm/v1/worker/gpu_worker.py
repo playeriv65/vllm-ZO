@@ -942,6 +942,20 @@ class Worker(WorkerBase):
     def pin_lora(self, lora_id: int) -> bool:
         return self.model_runner.pin_lora(lora_id)
 
+    def zo_score_prompt_token_ids(
+        self,
+        prompt_token_ids: list[list[int]],
+        lora_ids: list[int] | None = None,
+        max_logits_tokens: int = 8192,
+        loss_impl: str = "logprobs",
+    ) -> dict:
+        return self.model_runner.zo_score_prompt_token_ids(
+            prompt_token_ids,
+            lora_ids=lora_ids,
+            max_logits_tokens=max_logits_tokens,
+            loss_impl=loss_impl,
+        )
+
     def check_health(self) -> None:
         # worker will always be healthy as long as it's running.
         return

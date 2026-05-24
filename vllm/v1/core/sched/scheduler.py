@@ -1498,6 +1498,20 @@ class Scheduler(SchedulerInterface):
             # Get prompt logprobs for this request.
             prompt_logprobs_tensors = prompt_logprobs_dict.get(req_id)
             if (
+                prompt_logprobs_tensors is not None
+                and request.sampling_params is not None
+                and request.sampling_params.max_tokens == 0
+            ):
+                request.status = RequestStatus.FINISHED_LENGTH_CAPPED
+                stopped = True
+                finish_reason = request.get_finished_reason()
+                kv_transfer_params = self._free_request(request)
+                if status_before_stop == RequestStatus.RUNNING:
+                    stopped_running_reqs.add(request)
+                else:
+                    stopped_preempted_reqs.add(request)
+
+            if (
                 new_token_ids
                 or pooler_output is not None
                 or kv_transfer_params
@@ -1860,7 +1874,7 @@ class Scheduler(SchedulerInterface):
     def _free_blocks(self, request: Request):
         assert request.is_finished()
         self.kv_cache_manager.free(request)
-        del self.requests[request.request_id]
+        self.requests.pop(request.request_id, None)
 
     @property
     def pause_state(self) -> PauseState:

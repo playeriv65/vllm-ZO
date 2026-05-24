@@ -497,7 +497,11 @@ class SamplingParams(
             )
         if not 0.0 <= self.min_p <= 1.0:
             raise ValueError(f"min_p must be in [0, 1], got {self.min_p}.")
-        if self.max_tokens is not None and self.max_tokens < 1:
+        if (
+            self.max_tokens is not None
+            and self.max_tokens < 1
+            and not (self.max_tokens == 0 and self.prompt_logprobs is not None)
+        ):
             raise VLLMValidationError(
                 f"max_tokens must be at least 1, got {self.max_tokens}.",
                 parameter="max_tokens",

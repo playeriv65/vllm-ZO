@@ -109,6 +109,17 @@ class LogprobsTensors(NamedTuple):
         )
 
 
+class DirectPromptNLL(NamedTuple):
+    nll_sum: float
+    num_tokens: int
+
+    def to_cpu_nonblocking(self) -> "DirectPromptNLL":
+        return self
+
+
+PromptLogprobsOutput: TypeAlias = LogprobsTensors | DirectPromptNLL
+
+
 class RoutedExpertsTensors(NamedTuple):
     """Device-side snapshot of routed experts data, pending async D2H.
 
@@ -251,7 +262,7 @@ class ModelRunnerOutput:
     # [prompt_len, num_prompt_logprobs]
     # [prompt_len, num_prompt_logprobs]
     # [prompt_len]
-    prompt_logprobs_dict: dict[str, LogprobsTensors | None] = field(
+    prompt_logprobs_dict: dict[str, PromptLogprobsOutput | None] = field(
         default_factory=dict
     )
 
