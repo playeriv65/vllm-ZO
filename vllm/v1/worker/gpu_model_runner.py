@@ -1,14 +1,16 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import bisect
 import functools
 import gc
 import itertools
+import os
 import threading
 import time
 from collections import defaultdict
 from collections.abc import Callable, Iterable, Iterator, Sequence
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from copy import copy, deepcopy
 from dataclasses import dataclass, replace
 from functools import reduce
@@ -4278,6 +4280,68 @@ class GPUModelRunner(
         if self.supports_mm_inputs or self.enable_prompt_embeds:
             raise RuntimeError("ZO direct scoring only supports text token IDs.")
 
+        score_profile_seen = int(
+            getattr(self, "_zo_direct_profile_seen", 0)
+        ) + 1
+        self._zo_direct_profile_seen = score_profile_seen
+        profile_enabled = os.environ.get("VLLM_ZO_DIRECT_PROFILE") == "1"
+        profile_t0 = time.perf_counter()
+        profile_s: dict[str, float] = {}
+        profile_cuda_ms: dict[str, float] = {}
+        nvtx_skip = int(os.environ.get("VLLM_ZO_DIRECT_NVTX_SKIP", "0"))
+        nvtx_count = int(getattr(self, "_zo_direct_nvtx_count", 0))
+        nvtx_limit = int(os.environ.get("VLLM_ZO_DIRECT_NVTX_LIMIT", "1"))
+        nvtx_enabled = (
+            os.environ.get("VLLM_ZO_DIRECT_NVTX") == "1"
+            and score_profile_seen > nvtx_skip
+            and nvtx_count < nvtx_limit
+        )
+        if nvtx_enabled:
+            self._zo_direct_nvtx_count = nvtx_count + 1
+            torch.cuda.nvtx.range_push("zo_score.total")
+        torch_profile = None
+        torch_profile_trace_path = None
+        torch_profile_dir = os.environ.get("VLLM_ZO_DIRECT_TORCH_PROFILE_DIR")
+        if torch_profile_dir:
+            profile_skip = int(
+                os.environ.get("VLLM_ZO_DIRECT_TORCH_PROFILE_SKIP", "0")
+            )
+            profile_count = int(
+                getattr(self, "_zo_direct_torch_profile_count", 0)
+            )
+            profile_limit = int(
+                os.environ.get("VLLM_ZO_DIRECT_TORCH_PROFILE_STEPS", "1")
+            )
+            if score_profile_seen > profile_skip and profile_count < profile_limit:
+                os.makedirs(torch_profile_dir, exist_ok=True)
+                profile_count += 1
+                self._zo_direct_torch_profile_count = profile_count
+                torch_profile_trace_path = os.path.join(
+                    torch_profile_dir,
+                    f"zo_score_direct_worker_{profile_count:03d}.trace.json",
+                )
+                torch_profile = torch.profiler.profile(
+                    activities=[
+                        torch.profiler.ProfilerActivity.CPU,
+                        torch.profiler.ProfilerActivity.CUDA,
+                    ],
+                    record_shapes=True,
+                    profile_memory=False,
+                    with_stack=False,
+                )
+                torch_profile.__enter__()
+
+        def profile_region(name: str):
+            if torch_profile is not None:
+                return torch.profiler.record_function(name)
+            if nvtx_enabled:
+                return torch.cuda.nvtx.range(name)
+            return nullcontext()
+
+        def record_profile(name: str, start: float) -> None:
+            if profile_enabled:
+                profile_s[name] = time.perf_counter() - start
+
         num_reqs = len(prompt_token_ids)
         if num_reqs == 0:
             raise ValueError("prompt_token_ids must not be empty")
@@ -4311,42 +4375,151 @@ class GPUModelRunner(
             lora_ids_np = np.asarray(lora_ids, dtype=np.int32)
 
         active_lora_ids = sorted({int(item) for item in lora_ids_np if item > 0})
-        if self.lora_config is not None:
-            prompt_lora_mapping = tuple(int(item) for item in lora_ids_np)
-            token_lora_mapping = tuple(
-                int(item)
-                for item in np.repeat(lora_ids_np, lengths).astype(np.int32)
-            )
-            lora_requests = {
-                LoRARequest(
-                    lora_name=f"zo_direct_{lora_id}",
-                    lora_int_id=lora_id,
-                    lora_path="/zo/direct/preloaded",
-                )
-                for lora_id in active_lora_ids
-            }
-            self._set_active_loras(
-                prompt_lora_mapping,
-                token_lora_mapping,
-                lora_requests,
-            )
+        def try_set_zo_fast_lora_mapping() -> bool:
+            if os.environ.get("VLLM_ZO_FAST_LORA_MAPPING") != "1":
+                return False
+            if lora_ids is None or len(active_lora_ids) != 2 or num_reqs % 2 != 0:
+                return False
+            split = num_reqs // 2
+            plus_lora_id = int(lora_ids_np[0])
+            minus_lora_id = int(lora_ids_np[split])
+            if plus_lora_id <= 0 or minus_lora_id <= 0:
+                return False
+            if not (
+                np.all(lora_ids_np[:split] == plus_lora_id)
+                and np.all(lora_ids_np[split:] == minus_lora_id)
+            ):
+                return False
+            worker_lora_manager = getattr(self, "lora_manager", None)
+            if worker_lora_manager is None:
+                return False
+            adapter_manager = getattr(worker_lora_manager, "_adapter_manager", None)
+            if adapter_manager is None:
+                return False
+            existing_adapters = worker_lora_manager.list_adapters()
+            if (
+                plus_lora_id not in existing_adapters
+                or minus_lora_id not in existing_adapters
+            ):
+                return False
+            try:
+                plus_index = adapter_manager.lora_index_to_id.index(plus_lora_id)
+                minus_index = adapter_manager.lora_index_to_id.index(minus_lora_id)
+            except ValueError:
+                return False
+            if plus_index > minus_index:
+                return False
+            punica_wrapper = adapter_manager._get_punica_wrapper("language_model")
+            if punica_wrapper is None:
+                return False
 
-        (
-            cudagraph_mode,
-            batch_desc,
-            should_ubatch,
-            num_tokens_across_dp,
-            _cudagraph_stats,
-        ) = self._determine_batch_execution_and_padding(
-            num_tokens=num_tokens_unpadded,
-            num_reqs=num_reqs,
-            num_scheduled_tokens_np=lengths,
-            max_num_scheduled_tokens=max_query_len,
-            use_cascade_attn=False,
-            allow_microbatching=False,
-            force_has_lora=len(active_lora_ids) > 0,
-            force_num_active_loras=len(active_lora_ids),
-        )
+            plus_tokens = int(lengths[:split].sum())
+            minus_tokens = int(lengths[split:].sum())
+            if plus_tokens + minus_tokens != num_tokens_unpadded:
+                return False
+
+            punica_wrapper.is_prefill = True
+            punica_wrapper._token_lora_indices[:plus_tokens].fill_(plus_index)
+            punica_wrapper._token_lora_indices[
+                plus_tokens:num_tokens_unpadded
+            ].fill_(minus_index)
+            punica_wrapper._sampler_indices[:split].fill_(plus_index)
+            punica_wrapper._sampler_indices[split:num_reqs].fill_(minus_index)
+            sampler_arange = torch.arange(
+                num_reqs, device=self.device, dtype=torch.long
+            )
+            punica_wrapper._sampler_indices_padded[:num_reqs].copy_(
+                sampler_arange
+                + punica_wrapper._sampler_indices[:num_reqs] * num_reqs
+            )
+            punica_wrapper._embeddings_indices[:, :num_tokens_unpadded].zero_()
+            punica_wrapper.indices_len[:] = [
+                num_tokens_unpadded,
+                num_reqs,
+                num_reqs,
+                num_tokens_unpadded,
+            ]
+
+            def fill_meta(meta, first_count: int, second_count: int) -> None:
+                total = first_count + second_count
+                meta._reset()
+                meta.token_lora_mapping[:first_count].fill_(plus_index)
+                meta.token_lora_mapping[first_count:total].fill_(minus_index)
+                index_cache = getattr(self, "_zo_lora_index_cache", None)
+                if index_cache is None or index_cache.numel() < total:
+                    index_cache = torch.arange(
+                        total, device=self.device, dtype=torch.int32
+                    )
+                    self._zo_lora_index_cache = index_cache
+                meta.token_indices_sorted_by_lora_ids[:total].copy_(
+                    index_cache[:total], non_blocking=True
+                )
+                meta.active_lora_ids[0].fill_(plus_index)
+                meta.active_lora_ids[1].fill_(minus_index)
+                meta.num_tokens_per_lora[0].fill_(first_count)
+                meta.num_tokens_per_lora[1].fill_(second_count)
+                num_active_loras = 2
+                if meta.captured_lora_counts:
+                    idx = bisect.bisect_left(
+                        meta.captured_lora_counts, num_active_loras
+                    )
+                    if idx < len(meta.captured_lora_counts):
+                        num_active_loras = meta.captured_lora_counts[idx]
+                meta.num_active_loras_cpu[0] = num_active_loras
+                meta.lora_token_start_loc[1].fill_(first_count)
+                meta.lora_token_start_loc[2].fill_(total)
+
+            fill_meta(
+                punica_wrapper.token_mapping_meta,
+                plus_tokens,
+                minus_tokens,
+            )
+            fill_meta(punica_wrapper.prompt_mapping_meta, split, num_reqs - split)
+            return True
+
+        if self.lora_config is not None:
+            t0 = time.perf_counter()
+            with profile_region("zo_score.set_active_loras"):
+                if not try_set_zo_fast_lora_mapping():
+                    prompt_lora_mapping = tuple(int(item) for item in lora_ids_np)
+                    token_lora_mapping = tuple(
+                        int(item)
+                        for item in np.repeat(lora_ids_np, lengths).astype(np.int32)
+                    )
+                    lora_requests = {
+                        LoRARequest(
+                            lora_name=f"zo_direct_{lora_id}",
+                            lora_int_id=lora_id,
+                            lora_path="/zo/direct/preloaded",
+                        )
+                        for lora_id in active_lora_ids
+                    }
+                    self._set_active_loras(
+                        prompt_lora_mapping,
+                        token_lora_mapping,
+                        lora_requests,
+                    )
+            record_profile("set_active_loras_s", t0)
+
+        t0 = time.perf_counter()
+        with profile_region("zo_score.batch_execution"):
+            (
+                cudagraph_mode,
+                batch_desc,
+                should_ubatch,
+                num_tokens_across_dp,
+                _cudagraph_stats,
+            ) = self._determine_batch_execution_and_padding(
+                num_tokens=num_tokens_unpadded,
+                num_reqs=num_reqs,
+                num_scheduled_tokens_np=lengths,
+                max_num_scheduled_tokens=max_query_len,
+                use_cascade_attn=False,
+                allow_microbatching=False,
+                force_has_lora=len(active_lora_ids) > 0,
+                force_num_active_loras=len(active_lora_ids),
+            )
+        record_profile("batch_execution_s", t0)
         if should_ubatch:
             raise RuntimeError("ZO direct scoring does not support microbatching yet")
 
@@ -4354,31 +4527,41 @@ class GPUModelRunner(
         num_reqs_padded = (
             batch_desc.num_reqs if batch_desc.num_reqs is not None else num_reqs
         )
-        slot_mappings_by_group, slot_mappings = self._get_slot_mappings(
-            num_tokens_padded=num_tokens_padded,
-            num_reqs_padded=num_reqs_padded,
-            num_tokens_unpadded=num_tokens_unpadded,
-        )
+        t0 = time.perf_counter()
+        with profile_region("zo_score.slot_mappings"):
+            slot_mappings_by_group, slot_mappings = self._get_slot_mappings(
+                num_tokens_padded=num_tokens_padded,
+                num_reqs_padded=num_reqs_padded,
+                num_tokens_unpadded=num_tokens_unpadded,
+            )
+        record_profile("slot_mappings_s", t0)
 
-        flat_token_ids = np.fromiter(
-            itertools.chain.from_iterable(prompt_token_ids),
-            dtype=np.int32,
-            count=num_tokens_unpadded,
-        )
-        if flat_token_ids.shape[0] != num_tokens_unpadded:
-            raise RuntimeError("failed to flatten prompt token IDs")
+        t0 = time.perf_counter()
+        with profile_region("zo_score.flatten_loss_indices"):
+            flat_token_ids = np.fromiter(
+                itertools.chain.from_iterable(prompt_token_ids),
+                dtype=np.int32,
+                count=num_tokens_unpadded,
+            )
+            if flat_token_ids.shape[0] != num_tokens_unpadded:
+                raise RuntimeError("failed to flatten prompt token IDs")
 
-        loss_lengths = lengths - 1
-        num_loss_tokens = int(loss_lengths.sum())
-        request_offsets = np.concatenate(([0], np.cumsum(lengths[:-1], dtype=np.int64)))
-        pred_indices_np = np.concatenate(
-            [
-                np.arange(offset, offset + length - 1, dtype=np.int64)
-                for offset, length in zip(request_offsets, lengths)
-            ]
-        )
-        target_token_ids_np = flat_token_ids[pred_indices_np + 1]
-        loss_segments_np = np.repeat(np.arange(num_reqs, dtype=np.int64), loss_lengths)
+            loss_lengths = lengths - 1
+            num_loss_tokens = int(loss_lengths.sum())
+            request_offsets = np.concatenate(
+                ([0], np.cumsum(lengths[:-1], dtype=np.int64))
+            )
+            pred_indices_np = np.concatenate(
+                [
+                    np.arange(offset, offset + length - 1, dtype=np.int64)
+                    for offset, length in zip(request_offsets, lengths)
+                ]
+            )
+            target_token_ids_np = flat_token_ids[pred_indices_np + 1]
+            loss_segments_np = np.repeat(
+                np.arange(num_reqs, dtype=np.int64), loss_lengths
+            )
+        record_profile("flatten_loss_indices_s", t0)
 
         cache_key = (
             tuple(int(item) for item in lengths),
@@ -4390,122 +4573,150 @@ class GPUModelRunner(
         score_cache = getattr(self, "_zo_direct_score_cache", None)
         cache_hit = score_cache is not None and score_cache.get("key") == cache_key
         if cache_hit:
-            attn_metadata = score_cache["attn_metadata"]
-            slot_mappings = score_cache["slot_mappings"]
-            pred_indices = score_cache["pred_indices"]
-            target_token_ids = score_cache["target_token_ids"]
-            loss_segments = score_cache["loss_segments"]
-            request_num_tokens = score_cache["request_num_tokens"]
+            t0 = time.perf_counter()
+            with profile_region("zo_score.cache_hit_load"):
+                attn_metadata = score_cache["attn_metadata"]
+                slot_mappings = score_cache["slot_mappings"]
+                pred_indices = score_cache["pred_indices"]
+                target_token_ids = score_cache["target_token_ids"]
+                loss_segments = score_cache["loss_segments"]
+                request_num_tokens = score_cache["request_num_tokens"]
+            record_profile("cache_hit_load_s", t0)
         else:
-            if slot_mappings_by_group is not None:
-                if not self.kv_caches:
-                    raise RuntimeError("ZO direct scoring requires initialized KV cache")
-                available_kv_blocks = int(self.kv_caches[0].shape[1])
-                for block_table in self.input_batch.block_table.block_tables:
-                    block_table.block_table.np[:num_reqs_padded].fill(0)
-                    block_table.num_blocks_per_row[:num_reqs_padded] = 0
-                    manager_block_size = (
-                        block_table.block_size * block_table.blocks_per_kv_block
-                    )
-                    next_block_id = 1
-                    for req_idx, length in enumerate(lengths):
-                        num_blocks = cdiv(int(length), manager_block_size)
-                        if next_block_id + num_blocks > available_kv_blocks:
-                            raise RuntimeError(
-                                "not enough KV cache blocks for ZO direct scoring: "
-                                f"need block id {next_block_id + num_blocks - 1}, "
-                                f"available {available_kv_blocks - 1}"
-                            )
-                        block_table.add_row(
-                            list(range(next_block_id, next_block_id + num_blocks)),
-                            req_idx,
+            t0 = time.perf_counter()
+            with profile_region("zo_score.input_prep"):
+                if slot_mappings_by_group is not None:
+                    if not self.kv_caches:
+                        raise RuntimeError(
+                            "ZO direct scoring requires initialized KV cache"
                         )
-                        next_block_id += num_blocks
+                    available_kv_blocks = int(self.kv_caches[0].shape[1])
+                    for block_table in self.input_batch.block_table.block_tables:
+                        block_table.block_table.np[:num_reqs_padded].fill(0)
+                        block_table.num_blocks_per_row[:num_reqs_padded] = 0
+                        manager_block_size = (
+                            block_table.block_size * block_table.blocks_per_kv_block
+                        )
+                        next_block_id = 1
+                        for req_idx, length in enumerate(lengths):
+                            num_blocks = cdiv(int(length), manager_block_size)
+                            if next_block_id + num_blocks > available_kv_blocks:
+                                raise RuntimeError(
+                                    "not enough KV cache blocks for ZO direct scoring: "
+                                    f"need block id {next_block_id + num_blocks - 1}, "
+                                    f"available {available_kv_blocks - 1}"
+                                )
+                            block_table.add_row(
+                                list(range(next_block_id, next_block_id + num_blocks)),
+                                req_idx,
+                            )
+                            next_block_id += num_blocks
 
-            with self.synchronize_input_prep():
-                self.input_ids.cpu[:num_tokens_unpadded].copy_(
-                    torch.from_numpy(flat_token_ids)
+                with self.synchronize_input_prep():
+                    self.input_ids.cpu[:num_tokens_unpadded].copy_(
+                        torch.from_numpy(flat_token_ids)
+                    )
+                    self.input_ids.copy_to_gpu(num_tokens_unpadded)
+                    if num_tokens_padded > num_tokens_unpadded:
+                        self.input_ids.gpu[
+                            num_tokens_unpadded:num_tokens_padded
+                        ].zero_()
+
+                    cum_num_tokens = self._get_cumsum_and_arange(
+                        lengths, self.query_pos.np
+                    )
+                    self.query_pos.copy_to_gpu(num_tokens_unpadded)
+                    self.positions[:num_tokens_unpadded].copy_(
+                        self.query_pos.gpu[:num_tokens_unpadded],
+                        non_blocking=True,
+                    )
+                    if num_tokens_padded > num_tokens_unpadded:
+                        self.positions[num_tokens_unpadded:num_tokens_padded].zero_()
+
+                    self.query_start_loc.np[0] = 0
+                    self.query_start_loc.np[1 : num_reqs + 1] = cum_num_tokens
+                    self.query_start_loc.copy_to_gpu(num_reqs + 1)
+
+                    self.optimistic_seq_lens_cpu[:num_reqs] = torch.from_numpy(lengths)
+                    self.optimistic_seq_lens_cpu[num_reqs:].fill_(0)
+                    self.seq_lens.copy_(
+                        self.optimistic_seq_lens_cpu, non_blocking=True
+                    )
+
+                    self.input_batch.num_prompt_tokens[:num_reqs] = lengths
+                    self.input_batch.num_prompt_tokens[num_reqs:] = 0
+                    self.input_batch.num_computed_tokens_cpu[:num_reqs] = 0
+                    self.input_batch.num_computed_tokens_cpu[num_reqs:] = 0
+                    self.input_batch.num_tokens_no_spec[:num_reqs] = lengths
+                    self.input_batch.num_tokens_no_spec[num_reqs:] = 0
+                    self.input_batch.block_table.commit_block_table(num_reqs_padded)
+                    self.input_batch.block_table.compute_slot_mapping(
+                        num_reqs,
+                        self.query_start_loc.gpu[: num_reqs + 1],
+                        self.positions[:num_tokens_unpadded],
+                    )
+
+                    attn_metadata, _ = self._build_attention_metadata(
+                        num_tokens=num_tokens_unpadded,
+                        num_tokens_padded=num_tokens_padded,
+                        num_reqs=num_reqs,
+                        num_reqs_padded=num_reqs_padded,
+                        max_query_len=max_query_len,
+                        slot_mappings=slot_mappings_by_group,
+                        use_spec_decode=False,
+                    )
+            record_profile("input_prep_s", t0)
+
+            t0 = time.perf_counter()
+            with profile_region("zo_score.cache_tensor_setup"):
+                pred_indices = torch.from_numpy(pred_indices_np).to(
+                    self.device, non_blocking=True
                 )
-                self.input_ids.copy_to_gpu(num_tokens_unpadded)
-                if num_tokens_padded > num_tokens_unpadded:
-                    self.input_ids.gpu[num_tokens_unpadded:num_tokens_padded].zero_()
-
-                cum_num_tokens = self._get_cumsum_and_arange(lengths, self.query_pos.np)
-                self.query_pos.copy_to_gpu(num_tokens_unpadded)
-                self.positions[:num_tokens_unpadded].copy_(
-                    self.query_pos.gpu[:num_tokens_unpadded], non_blocking=True
+                target_token_ids = torch.from_numpy(target_token_ids_np).to(
+                    self.device, non_blocking=True
                 )
-                if num_tokens_padded > num_tokens_unpadded:
-                    self.positions[num_tokens_unpadded:num_tokens_padded].zero_()
-
-                self.query_start_loc.np[0] = 0
-                self.query_start_loc.np[1 : num_reqs + 1] = cum_num_tokens
-                self.query_start_loc.copy_to_gpu(num_reqs + 1)
-
-                self.optimistic_seq_lens_cpu[:num_reqs] = torch.from_numpy(lengths)
-                self.optimistic_seq_lens_cpu[num_reqs:].fill_(0)
-                self.seq_lens.copy_(self.optimistic_seq_lens_cpu, non_blocking=True)
-
-                self.input_batch.num_prompt_tokens[:num_reqs] = lengths
-                self.input_batch.num_prompt_tokens[num_reqs:] = 0
-                self.input_batch.num_computed_tokens_cpu[:num_reqs] = 0
-                self.input_batch.num_computed_tokens_cpu[num_reqs:] = 0
-                self.input_batch.num_tokens_no_spec[:num_reqs] = lengths
-                self.input_batch.num_tokens_no_spec[num_reqs:] = 0
-                self.input_batch.block_table.commit_block_table(num_reqs_padded)
-                self.input_batch.block_table.compute_slot_mapping(
-                    num_reqs,
-                    self.query_start_loc.gpu[: num_reqs + 1],
-                    self.positions[:num_tokens_unpadded],
+                loss_segments = torch.from_numpy(loss_segments_np).to(
+                    self.device, non_blocking=True
                 )
-
-                attn_metadata, _ = self._build_attention_metadata(
-                    num_tokens=num_tokens_unpadded,
-                    num_tokens_padded=num_tokens_padded,
-                    num_reqs=num_reqs,
-                    num_reqs_padded=num_reqs_padded,
-                    max_query_len=max_query_len,
-                    slot_mappings=slot_mappings_by_group,
-                    use_spec_decode=False,
-                )
-
-            pred_indices = torch.from_numpy(pred_indices_np).to(
-                self.device, non_blocking=True
-            )
-            target_token_ids = torch.from_numpy(target_token_ids_np).to(
-                self.device, non_blocking=True
-            )
-            loss_segments = torch.from_numpy(loss_segments_np).to(
-                self.device, non_blocking=True
-            )
-            request_num_tokens = [int(item) for item in loss_lengths.tolist()]
-            self._zo_direct_score_cache = {
-                "key": cache_key,
-                "attn_metadata": attn_metadata,
-                "slot_mappings": slot_mappings,
-                "pred_indices": pred_indices,
-                "target_token_ids": target_token_ids,
-                "loss_segments": loss_segments,
-                "request_num_tokens": request_num_tokens,
-            }
+                request_num_tokens = [int(item) for item in loss_lengths.tolist()]
+                self._zo_direct_score_cache = {
+                    "key": cache_key,
+                    "attn_metadata": attn_metadata,
+                    "slot_mappings": slot_mappings,
+                    "pred_indices": pred_indices,
+                    "target_token_ids": target_token_ids,
+                    "loss_segments": loss_segments,
+                    "request_num_tokens": request_num_tokens,
+                }
+            record_profile("cache_tensor_setup_s", t0)
 
         model_kwargs = self._init_model_kwargs()
-        with set_forward_context(
-            attn_metadata,
-            self.vllm_config,
-            num_tokens=num_tokens_padded,
-            num_tokens_across_dp=num_tokens_across_dp,
-            cudagraph_runtime_mode=cudagraph_mode,
-            batch_descriptor=batch_desc,
-            slot_mapping=slot_mappings,
-        ):
-            model_output = self._model_forward(
-                input_ids=self.input_ids.gpu[:num_tokens_padded],
-                positions=self.positions[:num_tokens_padded],
-                intermediate_tensors=None,
-                inputs_embeds=None,
-                **model_kwargs,
-            )
+        forward_start = forward_end = None
+        if profile_enabled and torch.cuda.is_available():
+            forward_start = torch.cuda.Event(enable_timing=True)
+            forward_end = torch.cuda.Event(enable_timing=True)
+            forward_start.record()
+        t0 = time.perf_counter()
+        with profile_region("zo_score.model_forward"):
+            with set_forward_context(
+                attn_metadata,
+                self.vllm_config,
+                num_tokens=num_tokens_padded,
+                num_tokens_across_dp=num_tokens_across_dp,
+                cudagraph_runtime_mode=cudagraph_mode,
+                batch_descriptor=batch_desc,
+                slot_mapping=slot_mappings,
+            ):
+                model_output = self._model_forward(
+                    input_ids=self.input_ids.gpu[:num_tokens_padded],
+                    positions=self.positions[:num_tokens_padded],
+                    intermediate_tensors=None,
+                    inputs_embeds=None,
+                    **model_kwargs,
+                )
+        record_profile("model_forward_call_s", t0)
+        if forward_end is not None:
+            forward_end.record()
 
         if self.use_aux_hidden_state_outputs:
             hidden_states, _ = model_output
@@ -4517,29 +4728,56 @@ class GPUModelRunner(
         request_nll_sums = torch.zeros(
             num_reqs, dtype=torch.float32, device=self.device
         )
-        chunk_size = max(1, int(max_logits_tokens))
-        for start in range(0, num_loss_tokens, chunk_size):
-            end = min(start + chunk_size, num_loss_tokens)
-            logits = self.model.compute_logits(hidden_states[pred_indices[start:end]])
-            if loss_impl == "cross_entropy":
-                token_nll = torch.nn.functional.cross_entropy(
-                    logits,
-                    target_token_ids[start:end].long(),
-                    reduction="none",
+        loss_start = loss_end = None
+        if profile_enabled and torch.cuda.is_available():
+            loss_start = torch.cuda.Event(enable_timing=True)
+            loss_end = torch.cuda.Event(enable_timing=True)
+            loss_start.record()
+        t0 = time.perf_counter()
+        with profile_region("zo_score.loss"):
+            chunk_size = max(1, int(max_logits_tokens))
+            for start in range(0, num_loss_tokens, chunk_size):
+                end = min(start + chunk_size, num_loss_tokens)
+                logits = self.model.compute_logits(
+                    hidden_states[pred_indices[start:end]]
                 )
-            else:
-                logprobs = self.sampler.compute_logprobs(logits)
-                selected_logprobs = logprobs.gather(
-                    -1, target_token_ids[start:end].unsqueeze(-1)
-                ).squeeze(-1)
-                token_nll = -selected_logprobs.float()
-            request_nll_sums.scatter_add_(0, loss_segments[start:end], token_nll.float())
+                if loss_impl == "cross_entropy":
+                    token_nll = torch.nn.functional.cross_entropy(
+                        logits,
+                        target_token_ids[start:end].long(),
+                        reduction="none",
+                    )
+                else:
+                    logprobs = self.sampler.compute_logprobs(logits)
+                    selected_logprobs = logprobs.gather(
+                        -1, target_token_ids[start:end].unsqueeze(-1)
+                    ).squeeze(-1)
+                    token_nll = -selected_logprobs.float()
+                request_nll_sums.scatter_add_(
+                    0, loss_segments[start:end], token_nll.float()
+                )
+        record_profile("loss_call_s", t0)
+        if loss_end is not None:
+            loss_end.record()
 
-        request_nll_sums_cpu = request_nll_sums.to("cpu", non_blocking=True)
-        self._sync_device()
+        t0 = time.perf_counter()
+        with profile_region("zo_score.sync"):
+            request_nll_sums_cpu = request_nll_sums.to("cpu", non_blocking=True)
+            self._sync_device()
+        record_profile("sync_s", t0)
+        if profile_enabled:
+            if forward_start is not None and forward_end is not None:
+                profile_cuda_ms["model_forward_ms"] = float(
+                    forward_start.elapsed_time(forward_end)
+                )
+            if loss_start is not None and loss_end is not None:
+                profile_cuda_ms["loss_ms"] = float(
+                    loss_start.elapsed_time(loss_end)
+                )
+            profile_s["total_worker_s"] = time.perf_counter() - profile_t0
         request_nll_sums_list = [float(item) for item in request_nll_sums_cpu.tolist()]
         total_nll = float(sum(request_nll_sums_list))
-        return {
+        result = {
             "loss": total_nll / float(num_loss_tokens),
             "nll_sum": total_nll,
             "num_tokens": num_loss_tokens,
@@ -4551,7 +4789,17 @@ class GPUModelRunner(
             "num_tokens_padded": int(num_tokens_padded),
             "num_active_loras": len(active_lora_ids),
             "loss_impl": loss_impl,
+            "cache_hit": bool(cache_hit),
+            "profile_s": profile_s,
+            "profile_cuda_ms": profile_cuda_ms,
         }
+        if torch_profile is not None:
+            torch_profile.__exit__(None, None, None)
+            torch_profile.export_chrome_trace(torch_profile_trace_path)
+            result["torch_profile_trace"] = torch_profile_trace_path
+        if nvtx_enabled:
+            torch.cuda.nvtx.range_pop()
+        return result
 
     @torch.inference_mode
     def sample_tokens(
