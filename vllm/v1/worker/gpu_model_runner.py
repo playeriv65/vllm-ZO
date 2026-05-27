@@ -4267,6 +4267,7 @@ class GPUModelRunner(
         self,
         prompt_token_ids: list[list[int]],
         lora_ids: list[int] | None = None,
+        loss_token_lens: list[int] | None = None,
         max_logits_tokens: int = 8192,
         loss_impl: str = "logprobs",
     ) -> dict[str, Any]:
@@ -4353,6 +4354,18 @@ class GPUModelRunner(
         lengths = np.asarray([len(item) for item in prompt_token_ids], dtype=np.int32)
         if (lengths < 2).any():
             raise ValueError("each prompt must contain at least two tokens")
+        if loss_token_lens is None:
+            loss_lengths = lengths - 1
+        else:
+            if len(loss_token_lens) != num_reqs:
+                raise ValueError("loss_token_lens must match prompt_token_ids length")
+            loss_lengths = np.asarray(loss_token_lens, dtype=np.int32)
+            if (loss_lengths < 0).any():
+                raise ValueError("loss_token_lens must be non-negative")
+            if (loss_lengths > lengths - 1).any():
+                raise ValueError(
+                    "loss_token_lens cannot exceed prompt length minus one"
+                )
         max_query_len = int(lengths.max())
         if max_query_len > self.max_model_len:
             raise ValueError(
@@ -4546,15 +4559,23 @@ class GPUModelRunner(
             if flat_token_ids.shape[0] != num_tokens_unpadded:
                 raise RuntimeError("failed to flatten prompt token IDs")
 
-            loss_lengths = lengths - 1
             num_loss_tokens = int(loss_lengths.sum())
+            if num_loss_tokens <= 0:
+                raise ValueError("at least one loss token is required")
             request_offsets = np.concatenate(
                 ([0], np.cumsum(lengths[:-1], dtype=np.int64))
             )
             pred_indices_np = np.concatenate(
                 [
-                    np.arange(offset, offset + length - 1, dtype=np.int64)
-                    for offset, length in zip(request_offsets, lengths)
+                    np.arange(
+                        offset + length - 1 - loss_length,
+                        offset + length - 1,
+                        dtype=np.int64,
+                    )
+                    for offset, length, loss_length in zip(
+                        request_offsets, lengths, loss_lengths
+                    )
+                    if loss_length > 0
                 ]
             )
             target_token_ids_np = flat_token_ids[pred_indices_np + 1]
@@ -4566,6 +4587,7 @@ class GPUModelRunner(
         cache_key = (
             tuple(int(item) for item in lengths),
             tuple(int(item) for item in lora_ids_np),
+            tuple(int(item) for item in loss_lengths),
             flat_token_ids.tobytes(),
             int(max_logits_tokens),
             str(loss_impl),

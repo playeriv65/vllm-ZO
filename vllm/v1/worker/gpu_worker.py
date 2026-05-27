@@ -946,12 +946,14 @@ class Worker(WorkerBase):
         self,
         prompt_token_ids: list[list[int]],
         lora_ids: list[int] | None = None,
+        loss_token_lens: list[int] | None = None,
         max_logits_tokens: int = 8192,
         loss_impl: str = "logprobs",
     ) -> dict:
         return self.model_runner.zo_score_prompt_token_ids(
             prompt_token_ids,
             lora_ids=lora_ids,
+            loss_token_lens=loss_token_lens,
             max_logits_tokens=max_logits_tokens,
             loss_impl=loss_impl,
         )
